@@ -796,6 +796,87 @@ class CalibrationTest(absltest.TestCase):
         probs = classifier.predict_proba(X)
         self.assertEqual(probs.shape, (150, 3))
 
+  def test_predict_oof_proba_sets_valid_mask_under_subsampling(self):
+    # Row subsampling makes each member validate on a different set of absolute
+    # rows; oof_valid_mask_ must mark exactly the rows a member predicted so
+    # fit() can blend each row over those members alone (issue #55).
+    classifier = TabFMClassifier(
+        model=self.model,
+        n_estimators=3,
+        batch_size=2,
+        max_num_rows=8,
+    )
+    X = np.random.rand(12, 3)
+    y = np.array([0, 1] * 6)
+    classifier.fit(X, y)
+
+    oof = classifier.predict_oof_proba(cv=2)
+    mask = classifier.oof_valid_mask_
+
+    self.assertEqual(mask.shape, (3, 12))
+    self.assertEqual(mask.dtype, np.bool_)
+    for i in range(3):
+      # A member's OOF row is a softmax (sums to 1) exactly where it predicted,
+      # and left at zero elsewhere.
+      predicted = oof[i].sum(axis=1) > 0
+      np.testing.assert_array_equal(predicted, mask[i])
+      np.testing.assert_allclose(oof[i, mask[i]].sum(axis=1), 1.0, atol=1e-6)
+
+  def test_calibration_blends_only_predicted_members(self):
+    # Issue #55: with per-member row subsampling the calibration input must
+    # average only the members that predicted each row, not the zero-filled
+    # gaps that would otherwise make rows sum to k / n_estimators.
+    mask = np.array([
+        [True, True, True, False, False, False],
+        [False, True, True, True, False, False],
+        [False, False, True, True, True, False],
+    ])
+    rng = np.random.RandomState(0)
+    oof = np.zeros((3, 6, 2))
+    for i in range(3):
+      for r in np.flatnonzero(mask[i]):
+        oof[i, r] = rng.dirichlet([1.0, 1.0])
+    X = rng.rand(6, 3)
+    y = np.array([0, 1, 0, 1, 0, 1])
+
+    captured = {}
+    real_fit_calibration = TabFMClassifier._fit_calibration
+
+    def spy(inner_self, P, targets):
+      captured["P"] = np.asarray(P).copy()
+      captured["y"] = np.asarray(targets).copy()
+      return real_fit_calibration(inner_self, P, targets)
+
+    classifier = TabFMClassifier(
+        model=self.model,
+        n_estimators=3,
+        binary_calibration_method="platt",
+    )
+
+    def fake_oof(cv=5):
+      classifier.oof_valid_mask_ = mask
+      return oof
+
+    patched_oof = mock.patch.object(
+        classifier, "predict_oof_proba", side_effect=fake_oof
+    )
+    patched_cal = mock.patch.object(TabFMClassifier, "_fit_calibration", spy)
+    with patched_oof, patched_cal:
+      classifier.fit(X, y)
+
+    P = captured["P"]
+    # Row 5 was predicted by nobody, so it is dropped; the rest stay in order.
+    self.assertEqual(P.shape, (5, 2))
+    np.testing.assert_array_equal(captured["y"], np.array([0, 1, 0, 1, 0]))
+    np.testing.assert_allclose(P.sum(axis=1), 1.0, atol=1e-6)
+    np.testing.assert_allclose(P[0], oof[0, 0], atol=1e-6)
+    np.testing.assert_allclose(P[1], (oof[0, 1] + oof[1, 1]) / 2, atol=1e-6)
+    np.testing.assert_allclose(
+        P[2], (oof[0, 2] + oof[1, 2] + oof[2, 2]) / 3, atol=1e-6
+    )
+    np.testing.assert_allclose(P[3], (oof[1, 3] + oof[2, 3]) / 2, atol=1e-6)
+    np.testing.assert_allclose(P[4], oof[2, 4], atol=1e-6)
+
 
 @unittest.skipUnless(HAS_JAX, "JAX is required")
 class StackingTest(absltest.TestCase):

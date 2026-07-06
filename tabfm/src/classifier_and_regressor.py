@@ -2508,15 +2508,19 @@ class TabFMClassifier(ClassifierMixin, BaseEstimator):
         and self.active_calibration_method_ != "none"
     ):
       oof_probs = self.predict_oof_proba(cv=self.num_folds_for_cv)
-      val_idx = getattr(self, "oof_val_indices_", None)
-      if val_idx is not None:
-        oof_probs_fit = oof_probs[:, val_idx, :]
-        y_orig_fit = y_orig[val_idx]
-        y_fit = y[val_idx]
-      else:
-        oof_probs_fit = oof_probs
-        y_orig_fit = y_orig
-        y_fit = y
+      valid_mask = getattr(self, "oof_valid_mask_", None)
+      if valid_mask is None:
+        valid_mask = np.ones(oof_probs.shape[:2], dtype=bool)
+      # Keep only rows some member predicted out of fold, and carry which
+      # members predicted each kept row so the blending below averages over
+      # those members alone. Without subsampling every member predicts every
+      # row, so this keeps all rows and the mask is all True (see
+      # predict_oof_proba).
+      kept = np.flatnonzero(valid_mask.any(axis=0))
+      oof_probs_fit = oof_probs[:, kept, :]
+      mask_fit = valid_mask[:, kept]
+      y_orig_fit = y_orig[kept]
+      y_fit = y[kept]
 
     if self.enable_nnls and oof_probs_fit is not None:
       n_classes = self.n_classes_
@@ -2548,10 +2552,15 @@ class TabFMClassifier(ClassifierMixin, BaseEstimator):
         and self.active_calibration_method_ != "none"
         and oof_probs_fit is not None
     ):
+      # enable_nnls forbids max_num_rows (see __init__), so the weighted blend
+      # never sees subsampling. The plain mean can, and must average each row
+      # over the members that predicted it, not the zero-filled gaps (which
+      # would otherwise make the row sum to k / n_estimators).
       if self.enable_nnls:
         P = np.tensordot(self.ensemble_weights_, oof_probs_fit, axes=(0, 0))
       else:
-        P = np.mean(oof_probs_fit, axis=0)
+        counts = mask_fit.sum(axis=0)
+        P = oof_probs_fit.sum(axis=0) / counts[:, None]
       assert P.shape == (len(y_fit), self.n_classes_), (
           f"Expected calibration input shape {(len(y_fit), self.n_classes_)},"
           f" got {P.shape}"
@@ -2957,14 +2966,16 @@ class TabFMClassifier(ClassifierMixin, BaseEstimator):
       folds_to_run = folds_base
 
     outputs_oof = np.zeros((n_estimators, N, n_classes))
-
-    self.oof_val_indices_ = None
-    for fold_idx, (train_fold, val_fold) in enumerate(folds_to_run):
+    # Which rows each member actually predicted out of fold. Under row
+    # subsampling (max_num_rows) members validate on different absolute rows,
+    # so outputs_oof stays zero everywhere else; fit() uses this mask to blend
+    # each row over the members that predicted it instead of averaging in the
+    # zero-filled gaps.
+    self.oof_valid_mask_ = np.zeros((n_estimators, N), dtype=bool)
+    for train_fold, val_fold in folds_to_run:
       data_fold, val_indices_list = self.ensemble_generator_.transform_fold(
           train_fold, val_fold
       )
-      if fold_idx == 0 and len(folds_to_run) == 1:
-        self.oof_val_indices_ = val_indices_list[0]
       (
           Xs_batch,
           ys_batch,
@@ -2988,6 +2999,7 @@ class TabFMClassifier(ClassifierMixin, BaseEstimator):
             out_i, axis=-1, temperature=self.softmax_temperature
         )
         outputs_oof[i, val_indices_list[i]] = out_i
+        self.oof_valid_mask_[i, val_indices_list[i]] = True
 
     return outputs_oof
 
